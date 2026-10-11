@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Manga Panel Finder</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='3' y='3' width='26' height='26' rx='4' fill='%23ffb547'/%3E%3Cpath d='M9 9h6v14H9zM17 9h6v6h-6zM17 17h6v6h-6z' fill='%23181a20'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#/" title="New search">
+      <span class="logo" aria-hidden="true"></span>
+      <span>Manga Panel Finder</span>
+    </a>
+    <nav>
+      <a class="navbtn" href="#/" id="nav-new">New search</a>
+      <a class="navbtn" href="#/history" id="nav-history">History</a>
+      <button class="navbtn" id="nav-settings" type="button">Settings</button>
+    </nav>
+  </header>
+
+  <main id="view"></main>
+
+  <div id="drop-overlay" class="drop-overlay" hidden>
+    <div class="drop-choice" data-action="search"><b>New search</b><span>Find the best version of this image</span></div>
+    <div class="drop-choice" data-action="add"><b>Add to this search</b><span>Check if it's a better version of the current panel</span></div>
+  </div>
+
+  <div id="modal-root"></div>
+  <div id="toasts" aria-live="polite"></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
