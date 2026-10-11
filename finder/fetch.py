@@ -22,7 +22,7 @@ _host_locks: dict[str, asyncio.Semaphore] = {}
 
 def _host_sem(host: str) -> asyncio.Semaphore:
     if host not in _host_locks:
-        _host_locks[host] = asyncio.Semaphore(2)  # never hammer one site
+        _host_locks[host] = asyncio.Semaphore(4)  # never hammer one site
     return _host_locks[host]
 
 

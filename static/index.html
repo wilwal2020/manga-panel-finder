@@ -3,31 +3,35 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Manga Panel Finder</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='3' y='3' width='26' height='26' rx='4' fill='%23ffb547'/%3E%3Cpath d='M9 9h6v14H9zM17 9h6v6h-6zM17 17h6v6h-6z' fill='%23181a20'/%3E%3C/svg%3E">
+  <title>Panel Finder</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='2' y='2' width='28' height='28' rx='7' fill='%23ff8a5b'/%3E%3Cpath d='M8 8h7v16H8zM17 8h7v7h-7zM17 17h7v7h-7z' fill='%231d0d05'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
   <header class="topbar">
-    <a class="brand" href="#/" title="New search">
-      <span class="logo" aria-hidden="true"></span>
-      <span>Manga Panel Finder</span>
+    <a class="brand" href="#/" aria-label="Panel Finder, new search">
+      <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true"><rect x="2" y="2" width="28" height="28" rx="7"/><path d="M8 8h7v16H8zM17 8h7v7h-7zM17 17h7v7h-7z"/></svg>
+      <span>Panel Finder</span>
     </a>
-    <nav>
-      <a class="navbtn" href="#/" id="nav-new">New search</a>
-      <a class="navbtn" href="#/history" id="nav-history">History</a>
-      <button class="navbtn" id="nav-settings" type="button">Settings</button>
+    <nav class="topnav" aria-label="Main">
+      <a class="navlink" href="#/" id="nav-new">New search</a>
+      <a class="navlink" href="#/history" id="nav-history">History</a>
+      <button class="navlink" type="button" id="nav-settings">Settings</button>
     </nav>
   </header>
 
   <main id="view"></main>
 
   <div id="drop-overlay" class="drop-overlay" hidden>
-    <div class="drop-choice" data-action="search"><b>New search</b><span>Find the best version of this image</span></div>
-    <div class="drop-choice" data-action="add"><b>Add to this search</b><span>Check if it's a better version of the current panel</span></div>
+    <div class="drop-choice" data-action="search" role="button" tabindex="0">
+      <b>New search</b><span>Find the best version of this image</span>
+    </div>
+    <div class="drop-choice" data-action="add" role="button" tabindex="0">
+      <b>Compare with this search</b><span>Check whether it's a better copy of the current panel</span>
+    </div>
   </div>
 
-  <div id="modal-root"></div>
+  <div id="layer"></div>
   <div id="toasts" aria-live="polite"></div>
 
   <script src="/static/app.js"></script>

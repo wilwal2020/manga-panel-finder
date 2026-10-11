@@ -244,17 +244,22 @@ async def set_roi(job_id: str, request: Request):
     return j.state()
 
 
-@app.post("/api/jobs/{job_id}/mangadex")
-async def mangadex(job_id: str, request: Request):
+@app.post("/api/jobs/{job_id}/sites")
+@app.post("/api/jobs/{job_id}/mangadex")  # old name, kept for older pages
+async def check_sites(job_id: str, request: Request):
     body = await request.json()
     j = get_job(job_id)
     title, chapter = (body.get("title") or "").strip(), str(body.get("chapter") or "").strip()
     if not title or not chapter:
         raise HTTPException(400, "Fill in both the manga title and the chapter number.")
-    if j.mangadex.get("state") == "running":
+    try:
+        float(chapter)
+    except ValueError:
+        raise HTTPException(400, "The chapter should be a number, like 31 or 10.5.")
+    if j.sites.get("state") == "running":
         return {"ok": True}
-    j.mangadex = {"state": "running", "message": "Starting..."}
-    keep_task(asyncio.create_task(j.mangadex_scan(title=title, chapter=chapter)))
+    j.sites = {"state": "running", "message": "Starting…", "rows": []}
+    keep_task(asyncio.create_task(j.sites_scan(title=title, chapter=chapter)))
     return {"ok": True}
 
 

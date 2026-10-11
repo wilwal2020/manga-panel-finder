@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 import shutil
 import time
 import traceback
@@ -15,8 +16,9 @@ from urllib.parse import urlparse
 import cv2
 import numpy as np
 
-from . import engines, fetch, imaging, match, panels
+from . import engines, fetch, imaging, match, panels, sources
 from .engines import Candidate
+from .sources import chapter_key
 
 EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="analyze")
 WORKERS = 6
@@ -27,7 +29,10 @@ DEFAULT_SETTINGS = {
     "use_tineye": True,
     "use_saucenao": True,
     "second_round": True,
-    "auto_mangadex": True,
+    "auto_sites": True,
+    "use_weebcentral": True,
+    "use_mangapill": True,
+    "use_mangadex": True,
     "max_checks": 60,
     "mangadex_languages": "",
     "save_folder": "",
@@ -55,6 +60,37 @@ def _clean(o):
     if isinstance(o, np.ndarray):
         return _clean(o.tolist())
     return o
+
+
+def _join_pages(hits) -> bytes | None:
+    """Stitch pages that sit side by side in the query (a two-page spread) into one image.
+
+    `hits` are (index, bytes, coverage, overlap box in query px) for consecutive pages.
+    """
+    items = [(h[3], h[1]) for h in hits if h[3]][:3]
+    if len(items) < 2:
+        return None
+    items.sort(key=lambda t: t[0][0])  # left to right as they appear in your image
+    for (a, _), (b, _) in zip(items, items[1:]):
+        overlap_y = min(a[3], b[3]) - max(a[1], b[1])
+        if overlap_y < 0.5 * min(a[3] - a[1], b[3] - b[1]) or (b[0] + b[2]) / 2 <= (a[0] + a[2]) / 2:
+            return None  # stacked or overlapping, not a spread
+    try:
+        pics = [imaging.decode(d) for _, d in items]
+    except imaging.NotAnImage:
+        return None
+    colored = any(p.rgb is not None for p in pics)
+    arrs = [(p.rgb if p.rgb is not None else cv2.cvtColor(p.gray, cv2.COLOR_GRAY2RGB)) if colored else p.gray for p in pics]
+    H = max(a.shape[0] for a in arrs)
+    arrs = [a if a.shape[0] == H else cv2.resize(a, (round(a.shape[1] * H / a.shape[0]), H), interpolation=cv2.INTER_CUBIC)
+            for a in arrs]
+    return imaging.encode_png(np.ascontiguousarray(np.concatenate(arrs, axis=1)))
+
+
+def _overlap(M, qshape, cshape):
+    """The part of the query (x0, y0, x1, y1 in query px) that a candidate also shows."""
+    box = match.overlap_box(np.asarray(M, np.float64), qshape, cshape)
+    return [round(float(v), 1) for v in box] if box else None
 
 
 def _host(u: str) -> str:
@@ -87,7 +123,7 @@ class Job:
         self.counters = {"found": 0, "checked": 0, "matched": 0, "failed": 0, "skipped": 0}
         self.results: dict[str, dict] = {}
         self.identification: dict = {}
-        self.mangadex: dict = {"state": "idle"}
+        self.sites: dict = {"state": "idle"}
         self.roi: list[float] | None = None
         self.query_info: dict = {}
         self.query_name = ""
@@ -286,6 +322,7 @@ class Job:
         wc = imaging.edge_width(region) if region.size >= 4000 else None
         detail = r["scale"] * (self._wq / wc) if (self._wq and wc) else r["scale"]
         crop, kind = panels.suggest_crop(pic.gray, geo["roi_in_cand"])
+        r["overlap_in_query"] = _overlap(M, qshape, pic.gray.shape)
         rx0, ry0, rx1, ry1 = self.roi or (0, 0, qshape[1], qshape[0])
         roi_area = max(1.0, (rx1 - rx0) * (ry1 - ry0))
         crop_q = match.apply(match.invert(M), match.rect_poly(*crop))
@@ -366,9 +403,11 @@ class Job:
                 await self._second_round(max(25, budget * 2 // 3))
             self._identify()
 
-            md = self.identification.get("md_chapter")
-            if md and s.get("auto_mangadex", True):
-                await self.mangadex_scan(chapter_id=md)
+            ident = self.identification
+            if s.get("auto_sites", True) and ((ident.get("title") and ident.get("chapter")) or ident.get("md_chapter")):
+                self.phase = "Checking manga sites"
+                await self.sites_scan(title=ident.get("title", ""), chapter=ident.get("chapter", ""),
+                                      chapter_id=ident.get("md_chapter", ""))
             self.phase = "Done"
             self.status = "done"
             self.log_msg(f"Finished: {len(self.results)} matching versions out of {self.counters['checked']} checked.")
@@ -474,61 +513,230 @@ class Job:
             return {"ok": True, "id": cid, "message": "It matches! Added to the results."}
         return {"ok": False, "message": "That image doesn't seem to contain your panel."}
 
-    # ------------------------------------------------------------------ MangaDex
+    # ------------------------------------------------------------------ manga sites
 
-    async def mangadex_scan(self, title: str = "", chapter: str = "", chapter_id: str = "",
-                            manga_id: str = ""):
+    async def sites_scan(self, title: str = "", chapter: str = "", chapter_id: str = ""):
+        """Open the chapter on manga reading sites and add every page that contains the query."""
         await self.ensure_query_loaded()
         self._start_workers()
-        md = self.mangadex = {"state": "running", "message": "Looking up the chapter on MangaDex..."}
+        title, chapter = (title or "").strip(), str(chapter or "").strip()
+        self._found_at = None  # (page index, page count) from the first site that finds the page
+        st = self.sites = {"state": "running", "title": title, "chapter": chapter, "rows": [],
+                           "message": f"Looking for {title} chapter {chapter} on manga sites…" if title else "Looking on MangaDex…"}
         try:
+            s = self.settings
+            hint = self._page_hint()
+            jobs = []
+            if title and chapter_key(chapter) is not None:
+                for key, cls in sources.SOURCES.items():
+                    if s.get(f"use_{key}", True):
+                        jobs.append(self._scan_source(cls(self.client), title, chapter, hint))
+            if s.get("use_mangadex", True) and (chapter_id or (title and chapter)):
+                jobs.append(self._scan_mangadex(title, chapter, chapter_id))
+            if not jobs:
+                st.update(state="done", message="All manga sites are switched off in Settings.")
+                return
+            await asyncio.gather(*jobs)
+            await self.drain()
+            hits = [r["site"] for r in st["rows"] if r.get("hit")]
+            st.update(state="done", message=(f"Found your page on {', '.join(hits)}." if hits
+                                             else "None of the manga sites had a matching page."))
+            self.log_msg(f"Manga sites: {st['message']}")
+        except Exception as e:  # noqa: BLE001
+            st.update(state="error", message=f"Checking manga sites failed: {type(e).__name__}: {e}")
+        finally:
+            self.save()
+
+    def _site_row(self, site: str) -> dict:
+        row = {"site": site, "state": "searching", "detail": ""}
+        self.sites.setdefault("rows", []).append(row)
+        return row
+
+    def _page_hint(self) -> int | None:
+        """Guess the page number from where the query was found (e.g. '.../0031-019.png' -> page 19)."""
+        votes: dict[int, int] = {}
+        for r in self.results.values():
+            for src in r["sources"]:
+                for u in (src.get("url", ""), src.get("page_url", "")):
+                    u = unquote_safe(u or "")
+                    m = (re.search(r"/\d{3,4}-(\d{2,3})\.(?:png|jpe?g|webp)", u, re.I)
+                         or re.search(r"/0*(\d{1,3})\.(?:png|jpe?g|webp)(?:\?|$)", u, re.I))
+                    if m and 0 < int(m.group(1)) < 400:
+                        votes[int(m.group(1))] = votes.get(int(m.group(1)), 0) + 1
+        return max(votes, key=votes.get) - 1 if votes else None
+
+    async def _scan_source(self, src, title: str, chapter: str, hint: int | None):
+        row = self._site_row(src.name)
+        try:
+            series = await src.find_series(title)
+            if not series:
+                row.update(state="not on this site")
+                return
+            row["detail"] = series.title
+            chs = await src.chapters(series)
+            ref = chs.get(chapter_key(chapter))
+            if ref is None:
+                row.update(state=f"no chapter {chapter}")
+                return
+            urls = await src.pages(ref)
+            if not urls:
+                row.update(state="no pages")
+                return
+            row["state"] = f"checking {len(urls)} pages"
+            hits = await self._find_pages(urls, src.referer, hint, src.name)
+            if not hits:
+                row.update(state="page not found")
+                return
+            row.update(state="page " + " + ".join(str(i + 1) for i, *_ in hits), hit=True)
+            page_url = src.chapter_page_url(ref, hits[0][0])
+            for i, data, _cov, _box in hits:
+                self._seen_urls.add(urls[i])
+                await self._process(Candidate(
+                    url=urls[i], engine=src.name, page_url=page_url, referer=src.referer, priority=0,
+                    title=f"{src.name} · {series.title} ch. {chapter} p. {i + 1}",
+                    note=f"{src.name}: chapter {chapter}, page {i + 1}"), data)
+            if len(hits) >= 2:
+                joined = await asyncio.get_running_loop().run_in_executor(EXECUTOR, _join_pages, hits)
+                if joined:
+                    pages = " + ".join(str(i + 1) for i, *_ in hits)
+                    await self._process(Candidate(
+                        url=f"{urls[hits[0][0]]}#pages-{pages.replace(' + ', '-')}", engine=src.name,
+                        page_url=page_url, priority=0, title=f"{src.name} · pages {pages} joined",
+                        note=f"{src.name}: pages {pages} joined into one spread"), joined)
+        except sources.SourceError as e:
+            row.update(state="blocked", detail=str(e))
+        except Exception as e:  # noqa: BLE001
+            row.update(state="error", detail=f"{type(e).__name__}: {str(e)[:120]}")
+
+    async def _find_pages(self, urls: list[str], referer: str, hint: int | None, label: str):
+        """Download pages (nearest the hint first) until the ones showing the query turn up.
+
+        Returns [(index, file bytes, coverage, overlap box in query px)], left-to-right in reading order.
+        """
+        n = len(urls)
+        if hint is not None and n:
+            hint = min(max(hint, 0), n - 1)
+            order = sorted(range(n), key=lambda i: (abs(i - hint), i))
+        else:
+            order = list(range(n))
+        loop = asyncio.get_running_loop()
+        sem = asyncio.Semaphore(4)
+        hits: dict[int, tuple] = {}
+        tried: set[int] = set()
+
+        async def check(i):
+            if i in tried:
+                return
+            tried.add(i)
+            async with sem:
+                try:
+                    data = await fetch.fetch_image(self.client, Candidate(url=urls[i], engine=label, referer=referer))
+                except fetch.FetchError:
+                    return
+                res = await loop.run_in_executor(EXECUTOR, self._page_match, data)
+                if res:
+                    hits[i] = (data, *res)
+
+        used_shared = None
+        while not hits:
+            # another site already found the page: jump to the same spot in this chapter
+            shared = self._found_at
+            if shared and shared != used_shared and n:
+                used_shared = shared
+                guess = round(shared[0] * n / max(1, shared[1]))
+                rest = [i for i in order if i not in tried]
+                order = sorted(rest, key=lambda i: (abs(i - guess), i))
+            batch = [i for i in order if i not in tried][:8]
+            if not batch:
+                break
+            await asyncio.gather(*[check(i) for i in batch])
+        if hits:
+            first = min(hits)
+            self._found_at = self._found_at or (first, n)
+        # your image may span two pages (a spread), so look either side of what was found
+        if hits and sum(v[1] for v in hits.values()) < 0.85:
+            await asyncio.gather(*[check(j) for i in list(hits) for j in (i - 1, i + 1) if 0 <= j < n])
+        return [(i, *hits[i]) for i in sorted(hits)]
+
+    def _page_match(self, data: bytes):
+        try:
+            pic = imaging.decode(data)
+        except imaging.NotAnImage:
+            return None
+        cf = match.extract(pic.gray, match.CAND_SIDE)
+        m = match.find(self._query.gray, self._qf, self._qfm, pic.gray, cf)
+        if m is None:
+            return None
+        geo = match.geometry(m.M, self._query.gray.shape, pic.gray.shape)
+        return geo["coverage"], match.overlap_box(m.M, self._query.gray.shape, pic.gray.shape)
+
+    async def _scan_mangadex(self, title: str, chapter: str, chapter_id: str):
+        row = self._site_row("MangaDex")
+        try:
+            manga_id = ""
             if chapter_id:
                 if chapter_id.isdigit():
                     chapter_id = await self._md_legacy(chapter_id)
                 info = await engines.mangadex_chapter_info(self.client, chapter_id)
                 manga_id, chapter = info["manga_id"], info["chapter"]
             if not manga_id:
-                found = await engines.mangadex_find_manga(self.client, title)
-                if not found:
-                    md.update(state="done", message=f"MangaDex has no manga called '{title}'.")
+                best, best_score = None, 0.0
+                for variant in sources.title_variants(title):
+                    for m in await engines.mangadex_find_manga(self.client, variant):
+                        sc = sources.title_score(title, m["title"])
+                        if sc > best_score:
+                            best, best_score = m, sc
+                    if best_score >= 0.75:
+                        break
+                if not best or best_score < 0.45:
+                    row.update(state="not on this site")
                     return
-                manga_id = found[0]["id"]
-                md["manga"] = found[0]["title"]
+                manga_id = best["id"]
+                row["detail"] = best["title"]
             langs = [x.strip() for x in (self.settings.get("mangadex_languages") or "").split(",") if x.strip()]
             versions = await engines.mangadex_chapter_versions(self.client, manga_id, str(chapter), langs or None)
             if not versions:
-                md.update(state="done", message=f"MangaDex has no readable versions of chapter {chapter}.")
+                row.update(state=f"no chapter {chapter}")
                 return
             versions.sort(key=lambda v: (v["lang"] != "en", v["lang"] != "ja"))
             versions = versions[:12]
-            md["message"] = f"Found {len(versions)} versions of chapter {chapter}; looking for your page..."
-            md["versions"] = [{"lang": v["lang"], "group": v["group"], "state": "waiting"} for v in versions]
-            anchor_idx = None
-            for vi, v in enumerate(versions):
+            row["state"] = f"checking {len(versions)} versions"
+            found = 0
+            loop = asyncio.get_running_loop()
+            for v in versions:
                 pages = await engines.mangadex_pages(self.client, v["id"])
-                n = len(pages["small"])
-                if anchor_idx is None:
-                    order = list(range(n))
-                else:
-                    order = sorted(range(n), key=lambda i: abs(i - anchor_idx))[:9]
-                hit = await self._md_find(pages["small"], order)
-                md["versions"][vi]["state"] = f"page {hit + 1}" if hit is not None else "not found"
-                if hit is None:
+                # find the page(s) on the small previews, then fetch the full-size files
+                hits = await self._find_pages(pages["small"], "", self._page_hint(), "MangaDex")
+                if not hits:
                     continue
-                if anchor_idx is None:
-                    anchor_idx = hit
-                self.add_candidates([Candidate(
-                    url=pages["full"][hit], engine="MangaDex",
-                    page_url=f"https://mangadex.org/chapter/{v['id']}/{hit + 1}",
-                    title=f"MangaDex · {v['lang']} · {v['group']}", priority=0,
-                    note=f"MangaDex chapter {v['chapter']} ({v['lang']}, {v['group']})")], force=True)
-            await self.drain()
-            found = sum(1 for v in md["versions"] if v["state"].startswith("page"))
-            md.update(state="done", message=f"Checked {len(versions)} MangaDex versions; your page is in {found}.")
+                found += 1
+                label = f"MangaDex · {v['lang']} · {v['group']}"
+                full = []
+                for i, *_ in hits:
+                    cand = Candidate(url=pages["full"][i], engine="MangaDex", priority=0,
+                                     page_url=f"https://mangadex.org/chapter/{v['id']}/{i + 1}", title=label,
+                                     note=f"MangaDex chapter {v['chapter']} ({v['lang']}, {v['group']}), page {i + 1}")
+                    try:
+                        data = await fetch.fetch_image(self.client, cand)
+                    except fetch.FetchError:
+                        continue
+                    self._seen_urls.add(cand.url)
+                    await self._process(cand, data)
+                    res = await loop.run_in_executor(EXECUTOR, self._page_match, data)
+                    if res:
+                        full.append((i, data, *res))
+                if len(full) >= 2:
+                    joined = await loop.run_in_executor(EXECUTOR, _join_pages, full)
+                    if joined:
+                        nums = " + ".join(str(i + 1) for i, *_ in full)
+                        await self._process(Candidate(
+                            url=f"{pages['full'][full[0][0]]}#pages-{nums.replace(' + ', '-')}", engine="MangaDex",
+                            page_url=f"https://mangadex.org/chapter/{v['id']}/{full[0][0] + 1}", priority=0,
+                            title=f"{label} · pages {nums} joined",
+                            note=f"MangaDex ({v['lang']}, {v['group']}): pages {nums} joined into one spread"), joined)
+            row.update(state=f"in {found} of {len(versions)} versions" if found else "page not found", hit=bool(found))
         except Exception as e:  # noqa: BLE001
-            md.update(state="error", message=f"MangaDex lookup failed: {type(e).__name__}: {e}")
-        finally:
-            self.save()
+            row.update(state="error", detail=f"{type(e).__name__}: {str(e)[:120]}")
 
     async def _md_legacy(self, legacy: str) -> str:
         r = await self.client.post(f"{engines.MD_API}/legacy/mapping",
@@ -536,40 +744,6 @@ class Job:
                                    headers={"User-Agent": engines.APP_UA})
         r.raise_for_status()
         return r.json()["data"][0]["attributes"]["newId"]
-
-    async def _md_find(self, urls: list[str], order: list[int]) -> int | None:
-        """Download small page previews in `order` until one contains the query."""
-        loop = asyncio.get_running_loop()
-        sem = asyncio.Semaphore(3)
-        found: list[int] = []
-
-        async def check(i):
-            if found:
-                return
-            async with sem:
-                if found:
-                    return
-                try:
-                    data = await fetch.fetch_image(self.client, Candidate(url=urls[i], engine="MangaDex"))
-                except fetch.FetchError:
-                    return
-                ok = await loop.run_in_executor(EXECUTOR, self._quick_match, data)
-                if ok:
-                    found.append(i)
-
-        for start in range(0, len(order), 6):
-            await asyncio.gather(*[check(i) for i in order[start:start + 6]])
-            if found:
-                return min(found, key=lambda i: order.index(i))
-        return None
-
-    def _quick_match(self, data: bytes) -> bool:
-        try:
-            pic = imaging.decode(data)
-        except imaging.NotAnImage:
-            return False
-        cf = match.extract(pic.gray, match.CAND_SIDE)
-        return match.find(self._query.gray, self._qf, self._qfm, pic.gray, cf) is not None
 
     # ------------------------------------------------------------------ output
 
@@ -596,7 +770,7 @@ class Job:
             "query": self.query_info, "roi": self.roi, "engines": self.engines, "counters": self.counters,
             "identification": {k: v for k, v in self.identification.items() if k != "saucenao"},
             "saucenao": self.identification.get("saucenao", []),
-            "mangadex": self.mangadex, "picks": self.picks(),
+            "sites": self.sites, "picks": self.picks(),
         }
         if full:
             d["results"] = [{k: v for k, v in r.items() if k != "M"} for r in rs]
@@ -612,7 +786,7 @@ class Job:
             data = {
                 "id": self.id, "created": self.created, "status": self.status if self.status != "running" else "done",
                 "query_info": self.query_info, "roi": self.roi, "engines": self.engines,
-                "counters": self.counters, "identification": self.identification, "mangadex": self.mangadex,
+                "counters": self.counters, "identification": self.identification, "sites": self.sites,
                 "results": list(self.results.values()), "log": self.log[-60:],
                 "seen_sha": self._seen_sha,
             }
@@ -634,10 +808,14 @@ class Job:
         j.engines = d.get("engines", {})
         j.counters = d.get("counters", j.counters)
         j.identification = d.get("identification", {})
-        j.mangadex = d.get("mangadex", {"state": "idle"})
-        if j.mangadex.get("state") == "running":
-            j.mangadex = {"state": "idle"}
+        j.sites = d.get("sites") or {"state": "idle"}
+        if j.sites.get("state") == "running":
+            j.sites = {"state": "idle"}
         j.results = {r["id"]: r for r in d.get("results", [])}
+        qshape = (j.query_info["height"], j.query_info["width"])
+        for r in j.results.values():  # searches saved by older versions lack this
+            if "overlap_in_query" not in r and "M" in r:
+                r["overlap_in_query"] = _overlap(r["M"], qshape, (r["height"], r["width"]))
         j.log = d.get("log", [])
         j._seen_sha = d.get("seen_sha", {})
         j._seen_urls = {s["url"] for r in j.results.values() for s in r["sources"]}
